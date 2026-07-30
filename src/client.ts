@@ -10,7 +10,11 @@
  */
 
 import tls from "node:tls";
-import { Agent, ProxyAgent, type Dispatcher } from "undici";
+// Import fetch from undici too (not Node's global): the global fetch uses Node's
+// built-in undici copy, which rejects a dispatcher built by this (possibly
+// different) undici version with UND_ERR_INVALID_ARG. Same-package fetch+Agent
+// are guaranteed compatible.
+import { fetch, FormData, Agent, ProxyAgent, type Dispatcher } from "undici";
 import type { MaxUpdatesResponse } from "./types.js";
 import { RUSSIAN_TRUSTED_CA } from "./max-ca.js";
 
@@ -70,7 +74,7 @@ async function maxRequest<T>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
       dispatcher,
-    } as unknown as RequestInit);
+    });
 
     const text = await res.text();
     if (!res.ok) {
@@ -175,7 +179,7 @@ export async function getUpdates(
       headers: { Authorization: token },
       signal: combinedSignal,
       dispatcher,
-    } as unknown as RequestInit);
+    });
 
     if (!res.ok) {
       const text = await res.text();
@@ -229,7 +233,7 @@ export async function downloadFile(token: string, url: string): Promise<Buffer |
     const res = await fetch(url, {
       headers: { Authorization: token },
       dispatcher,
-    } as unknown as RequestInit);
+    });
     if (!res.ok) return null;
     return Buffer.from(await res.arrayBuffer());
   } catch {
@@ -262,7 +266,7 @@ export async function uploadFile(uploadUrl: string, buffer: Buffer, mimeType: st
       method: "POST",
       body: form,
       dispatcher,
-    } as unknown as RequestInit);
+    });
     if (!res.ok) return null;
     const json = await res.json() as Record<string, unknown>;
     // Direct token at top level
