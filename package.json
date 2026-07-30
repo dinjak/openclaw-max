@@ -1,6 +1,6 @@
 {
   "name": "@olegbalbekov/openclaw-max",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "MAX messenger (max.ru) channel plugin for OpenClaw",
   "type": "module",
   "main": "./dist/index.js",
@@ -24,7 +24,7 @@
     "lint": "eslint src index.ts"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.3.24"
+    "openclaw": "*"
   },
   "devDependencies": {
     "openclaw": ">=2026.3.24",
@@ -63,7 +63,7 @@
       "order": 80
     },
     "install": {
-      "npmSpec": "@openclaw/max",
+      "npmSpec": "@olegbalbekov/openclaw-max",
       "localPath": "extensions/max",
       "defaultChoice": "npm"
     }

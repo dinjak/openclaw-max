@@ -2,8 +2,6 @@
 
 MAX messenger (max.ru) channel plugin for [OpenClaw](https://github.com/openclaw/openclaw).
 
-> **Requires OpenClaw ≥ 2026.3.24**
-
 ## Features
 
 - DM and group chat support
@@ -128,7 +126,6 @@ For production, configure a webhook instead of long polling:
 
 **Plugin not starting / `channels.max: unknown channel id`**
 
-- Check that OpenClaw version is ≥ 2026.3.24 (`openclaw --version`)
 - Make sure `plugins.allow` is NOT set (or includes `"max"` explicitly)
 
 **Telegram stops working after adding MAX**
