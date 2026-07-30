@@ -93,6 +93,20 @@ Should show: `MAX default: enabled, dm:allowlist, allow:YOUR_USER_ID`
 | `groupAllowFrom` | string[] | `[]` | MAX user IDs allowed in group chats (when groupPolicy=allowlist) |
 | `webhookUrl` | string | — | Webhook URL (optional, uses long polling if not set) |
 | `webhookSecret` | string | — | Webhook secret for request verification |
+| `httpProxy` | string | — | Optional HTTP(S) proxy for MAX API traffic, e.g. `http://user:pass@host:port` |
+
+## MAX API migration (July 2026)
+
+As of **2026-07-19** MAX decommissioned the legacy `platform-api.max.ru` host. This
+plugin (v0.5.0+) talks to the new `platform-api2.max.ru` endpoint. That host serves
+a TLS chain anchored on the **Russian Trusted Root CA (Минцифры)**, which is not in
+Node's bundled certificate store — so the plugin ships that CA and trusts it
+automatically (on top of the default roots). No manual `NODE_EXTRA_CA_CERTS` setup
+is required. Bot tokens are sent via the `Authorization` header, as the new API
+mandates.
+
+If your gateway has no direct route to `platform-api2.max.ru`, set `httpProxy` to
+tunnel all MAX traffic through a proxy.
 
 ## Webhook mode (optional)
 

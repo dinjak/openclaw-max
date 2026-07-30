@@ -16,7 +16,7 @@ import {
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
 import { z } from "zod";
 import { listAccountIds, resolveAccount } from "./accounts.js";
-import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile } from "./client.js";
+import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport } from "./client.js";
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
 import type { InboundImage } from "./webhook-handler.js";
@@ -423,6 +423,14 @@ export function createMaxPlugin(): any {
         if (!account.token) {
           log?.warn?.(`[openclaw-max] Account ${accountId} missing token, skipping`);
           return waitUntilAbort(ctx.abortSignal);
+        }
+
+        // Configure the HTTP transport (Минцифры CA + optional proxy) before any
+        // API call. Note: the transport is process-global, so with multiple
+        // accounts the last-started account's proxy wins; the CA trust is shared.
+        configureMaxTransport({ httpProxy: account.httpProxy });
+        if (account.httpProxy) {
+          log?.info?.(`[openclaw-max] Using HTTP proxy for MAX API traffic`);
         }
 
         // Verify token on startup

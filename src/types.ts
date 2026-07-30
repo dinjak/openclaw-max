@@ -22,6 +22,11 @@ export interface MaxAccountConfig {
   dmPolicy?: "open" | "allowlist" | "pairing" | "disabled";
   /** Allowlisted MAX user IDs (numeric) or usernames */
   allowFrom?: string[];
+  /**
+   * Optional HTTP(S) proxy for all MAX API traffic, e.g. http://user:pass@host:port.
+   * Useful when the gateway has no direct route to platform-api2.max.ru.
+   */
+  httpProxy?: string;
 }
 
 export interface MaxConfig extends MaxAccountConfig {
@@ -37,6 +42,7 @@ export interface ResolvedMaxAccount {
   webhookPath: string;
   dmPolicy: "open" | "allowlist" | "pairing" | "disabled";
   allowFrom: string[];
+  httpProxy?: string;
 }
 
 // ─── API objects ──────────────────────────────────────────────────────────────

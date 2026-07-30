@@ -1,13 +1,41 @@
 /**
  * MAX Bot API HTTP client.
- * https://platform-api.max.ru
+ * https://platform-api2.max.ru
+ *
+ * The MAX Bot API moved off platform-api.max.ru (decommissioned 2026-07-19) to
+ * platform-api2.max.ru, whose TLS chain is anchored on the Russian Trusted Root
+ * CA (Минцифры) — absent from Node's bundled CA store. We therefore route every
+ * request through a dedicated undici dispatcher that trusts that CA in addition
+ * to the platform defaults, and optionally through an HTTP(S) proxy.
  */
 
+import tls from "node:tls";
+import { Agent, ProxyAgent, type Dispatcher } from "undici";
 import type { MaxUpdatesResponse } from "./types.js";
+import { RUSSIAN_TRUSTED_CA } from "./max-ca.js";
 
-const MAX_API = "https://platform-api.max.ru";
+const MAX_API = "https://platform-api2.max.ru";
 const REQUEST_TIMEOUT_MS = 30_000;
 const LONG_POLL_TIMEOUT_SEC = 30;
+
+// ─── TLS / proxy transport ────────────────────────────────────────────────────
+
+// Trust the Минцифры CA on top of the default root store.
+const MAX_CA: string[] = [RUSSIAN_TRUSTED_CA, ...tls.rootCertificates];
+
+let dispatcher: Dispatcher = new Agent({ connect: { ca: MAX_CA } });
+
+/**
+ * (Re)configure the HTTP transport for MAX API calls.
+ * Call once at channel startup. When `httpProxy` is set, requests are tunnelled
+ * through it (fixes GitHub issue #1); the Минцифры CA is trusted either way.
+ */
+export function configureMaxTransport(opts?: { httpProxy?: string }): void {
+  const proxy = opts?.httpProxy?.trim();
+  dispatcher = proxy
+    ? new ProxyAgent({ uri: proxy, connect: { ca: MAX_CA } })
+    : new Agent({ connect: { ca: MAX_CA } });
+}
 
 // ─── Low-level fetch helper ───────────────────────────────────────────────────
 
@@ -41,7 +69,8 @@ async function maxRequest<T>(
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
-    });
+      dispatcher,
+    } as unknown as RequestInit);
 
     const text = await res.text();
     if (!res.ok) {
@@ -145,7 +174,8 @@ export async function getUpdates(
       method: "GET",
       headers: { Authorization: token },
       signal: combinedSignal,
-    });
+      dispatcher,
+    } as unknown as RequestInit);
 
     if (!res.ok) {
       const text = await res.text();
@@ -196,7 +226,10 @@ export async function getBotInfo(token: string): Promise<{ name: string; usernam
  */
 export async function downloadFile(token: string, url: string): Promise<Buffer | null> {
   try {
-    const res = await fetch(url, { headers: { Authorization: token } });
+    const res = await fetch(url, {
+      headers: { Authorization: token },
+      dispatcher,
+    } as unknown as RequestInit);
     if (!res.ok) return null;
     return Buffer.from(await res.arrayBuffer());
   } catch {
@@ -225,7 +258,11 @@ export async function uploadFile(uploadUrl: string, buffer: Buffer, mimeType: st
   try {
     const form = new FormData();
     form.append("data", new Blob([buffer], { type: mimeType }), filename);
-    const res = await fetch(uploadUrl, { method: "POST", body: form });
+    const res = await fetch(uploadUrl, {
+      method: "POST",
+      body: form,
+      dispatcher,
+    } as unknown as RequestInit);
     if (!res.ok) return null;
     const json = await res.json() as Record<string, unknown>;
     // Direct token at top level

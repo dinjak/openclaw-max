@@ -44,6 +44,7 @@ export function resolveAccount(
     webhookPath: merged.webhookPath ?? DEFAULT_WEBHOOK_PATH,
     dmPolicy: merged.dmPolicy ?? "pairing",
     allowFrom: normalizeAllowFrom(merged.allowFrom),
+    httpProxy: merged.httpProxy?.trim() || undefined,
   };
 }
 

@@ -4,7 +4,7 @@
   "channels": ["max"],
   "name": "MAX",
   "description": "MAX messenger (max.ru) channel plugin for OpenClaw",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -17,7 +17,8 @@
           "dmPolicy": { "type": "string" },
           "allowFrom": { "type": "array", "items": { "type": "string" } },
           "webhookUrl": { "type": "string" },
-          "webhookSecret": { "type": "string" }
+          "webhookSecret": { "type": "string" },
+          "httpProxy": { "type": "string" }
         }
       }
     }
@@ -59,6 +60,9 @@
           },
           "webhookSecret": {
             "type": "string"
+          },
+          "httpProxy": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -91,6 +95,10 @@
         "webhookSecret": {
           "label": "Webhook Secret",
           "help": "Optional secret for webhook request verification."
+        },
+        "httpProxy": {
+          "label": "HTTP Proxy",
+          "help": "Optional HTTP(S) proxy for MAX API traffic, e.g. http://user:pass@host:port."
         }
       }
     }
