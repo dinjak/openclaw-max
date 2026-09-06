@@ -16,7 +16,7 @@ import {
 import { registerPluginHttpRoute } from "openclaw/plugin-sdk/webhook-ingress";
 import { z } from "zod";
 import { listAccountIds, resolveAccount } from "./accounts.js";
-import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport } from "./client.js";
+import { sendDm, sendToChat, sendDmWithImage, sendToChatWithImage, editMessage, deleteMessage, sendTypingAction, getUpdates, subscribeWebhook, deleteWebhook, getBotInfo, getUploadUrl, uploadFile, configureMaxTransport } from "./client.js";
 import { getMaxRuntime } from "./runtime.js";
 import { createWebhookHandler, handleUpdate } from "./webhook-handler.js";
 import type { InboundImage } from "./webhook-handler.js";
@@ -53,6 +53,13 @@ function waitUntilAbort(signal?: AbortSignal, onAbort?: () => void): Promise<voi
 
 /** Minimum interval between streaming edits (ms) to avoid rate limits */
 const STREAM_EDIT_INTERVAL_MS = 800;
+const TYPING_INTERVAL_MS = 4000;
+/** Leak guard only — reset on activity so long think/tool turns keep typing. */
+const TYPING_SAFETY_MS = 30 * 60 * 1000;
+const PLACEHOLDER_DELAY_MS = 500;
+const STATUS_MAX_LINES = 6;
+const STATUS_LINE_CHARS = 120;
+const PLACEHOLDER_TEXT = "⏳ обрабатываю…";
 
 /**
  * Send a reply to the user based on chat type.
@@ -74,10 +81,44 @@ async function sendReply(
   }
 }
 
+function isSilentFinalText(text: unknown): boolean {
+  const t = String(text ?? "").trim();
+  return !t || t === "NO_REPLY" || t === "HEARTBEAT_OK";
+}
+
+function truncateStatus(text: unknown, max = STATUS_LINE_CHARS): string {
+  const t = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function toolStatusIcon(name: unknown): string {
+  const n = String(name ?? "").toLowerCase();
+  if (n.includes("search") || n.includes("web") || n.includes("fetch")) return "🔎";
+  if (n.includes("exec") || n.includes("bash") || n.includes("shell")) return "🛠️";
+  if (n === "read" || n.includes("read_file") || n.endsWith(".read")) return "📖";
+  if (n.includes("write") || n.includes("edit") || n.includes("apply_patch")) return "✍️";
+  return "⚙️";
+}
+
+function shortToolHint(args: unknown): string {
+  if (!args || typeof args !== "object") return "";
+  const rec = args as Record<string, unknown>;
+  const preferred = rec.command ?? rec.cmd ?? rec.query ?? rec.url ?? rec.path ?? rec.file ?? rec.target;
+  if (typeof preferred === "string" && preferred.trim()) return truncateStatus(preferred, 80);
+  return "";
+}
+
+type StreamPhase = "idle" | "status" | "streaming" | "done";
+
 /**
  * Create a streaming deliverer:
- * - onPartialToken(text): called per streaming token → sends/edits message with ▌ cursor
+ * - onWorkStart / onStatus: visible activity before any answer tokens exist
+ * - onPartialToken(text): called per streaming token → sends/edits message with cursor
  * - deliver(payload): called once at end with full text → final clean edit (no cursor)
+ *
+ * MAX Bot API typing (`POST /chats/{chatId}/actions`, action typing_on) is documented
+ * for group chats and is ephemeral; DMs need an editable placeholder to stay alive.
  */
 function createStreamingDeliver(
   account: ResolvedMaxAccount,
@@ -87,35 +128,59 @@ function createStreamingDeliver(
   log?: any,
 ): {
   onPartialToken: (text: string) => Promise<void>;
+  onWorkStart: () => Promise<void>;
+  onThinking: () => Promise<void>;
+  onToolStart: (payload: { name?: string; args?: unknown }) => Promise<void>;
+  onItemEvent: (payload: {
+    title?: string;
+    summary?: string;
+    progressText?: string;
+    name?: string;
+  }) => Promise<void>;
+  onApprovalEvent: (payload: { phase?: string; title?: string }) => Promise<void>;
   deliver: (payload: { text?: string; body?: string }) => Promise<void>;
+  finish: () => Promise<void>;
 } {
   let messageId: string | null = null;
   let accumulated = "";
   let lastEditAt = 0;
   let pendingEdit: ReturnType<typeof setTimeout> | null = null;
+  let phase: StreamPhase = "idle";
+  let thinkingNoted = false;
+  const progressLines: string[] = [];
 
   // Typing indicator — declared early so throttledEdit can reference it
   const numericDialogChatId = parseInt(dialogChatId, 10);
   let typingInterval: ReturnType<typeof setInterval> | null = null;
+  let safetyTimer: ReturnType<typeof setTimeout> | null = null;
   if (!isNaN(numericDialogChatId)) {
     sendTypingAction(account.token, numericDialogChatId).catch(() => {});
     typingInterval = setInterval(() => {
       sendTypingAction(account.token, numericDialogChatId).catch(() => {});
-    }, 4000);
+    }, TYPING_INTERVAL_MS);
   }
 
   // Unique key for this deliver instance (not chatId — concurrent messages share chatId)
   const instanceKey = String(++typingStopSeq);
 
-  // Safety timeout — stop typing after 90s even if deliver() is never called
-  const safetyTimer = setTimeout(() => stopTyping(), 90_000);
+  function armTypingSafety() {
+    if (safetyTimer) clearTimeout(safetyTimer);
+    safetyTimer = setTimeout(() => stopTyping(), TYPING_SAFETY_MS);
+  }
 
   function stopTyping() {
-    clearTimeout(safetyTimer);
-    if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
+    if (safetyTimer) {
+      clearTimeout(safetyTimer);
+      safetyTimer = null;
+    }
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+    }
     activeTypingStops.delete(instanceKey);
   }
 
+  armTypingSafety();
   // Register so sendMedia can stop ALL active typing intervals
   activeTypingStops.set(instanceKey, stopTyping);
 
@@ -143,40 +208,139 @@ function createStreamingDeliver(
     }
   }
 
-    // Promise to prevent race condition on first message creation
+  // Promise to prevent race condition on first message creation
   let creationPromise: Promise<void> | null = null;
+
+  async function ensureVisible(text: string) {
+    if (!text) return;
+    if (!creationPromise) {
+      creationPromise = (async () => {
+        messageId = await sendReply(account, chatId, chatType, text);
+        lastEditAt = Date.now();
+        log?.info?.(`[openclaw-max] Activity message mid=${messageId}`);
+      })();
+      await creationPromise;
+      return;
+    }
+    await creationPromise;
+    await throttledEdit(text);
+  }
+
+  function renderStatus(): string {
+    const lines = [PLACEHOLDER_TEXT, ...progressLines.slice(-STATUS_MAX_LINES)];
+    return lines.join("\n");
+  }
+
+  async function showStatus() {
+    if (phase === "streaming" || phase === "done") return;
+    phase = "status";
+    armTypingSafety();
+    await ensureVisible(renderStatus());
+  }
+
+  let placeholderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    if (phase === "idle") showStatus().catch(() => {});
+  }, PLACEHOLDER_DELAY_MS);
+
+  function cancelPlaceholderTimer() {
+    if (placeholderTimer) {
+      clearTimeout(placeholderTimer);
+      placeholderTimer = null;
+    }
+  }
+
+  async function onWorkStart() {
+    cancelPlaceholderTimer();
+    if (phase === "idle" || phase === "status") await showStatus();
+  }
+
+  async function pushProgressLine(line: string) {
+    const cleaned = truncateStatus(line);
+    if (!cleaned) return;
+    if (progressLines[progressLines.length - 1] === cleaned) return;
+    progressLines.push(cleaned);
+    if (progressLines.length > STATUS_MAX_LINES) progressLines.shift();
+    await showStatus();
+  }
+
+  async function onThinking() {
+    if (thinkingNoted) return;
+    thinkingNoted = true;
+    await pushProgressLine("💭 думаю…");
+  }
+
+  async function onToolStart(payload: { name?: string; args?: unknown }) {
+    const name = typeof payload?.name === "string" ? payload.name.trim() : "";
+    if (!name) return;
+    const hint = shortToolHint(payload?.args);
+    const line = hint
+      ? `${toolStatusIcon(name)} ${name}: ${hint}`
+      : `${toolStatusIcon(name)} ${name}`;
+    await pushProgressLine(line);
+  }
+
+  async function onItemEvent(payload: {
+    title?: string;
+    summary?: string;
+    progressText?: string;
+    name?: string;
+  }) {
+    const title = typeof payload?.title === "string" ? payload.title.trim() : "";
+    const summary = typeof payload?.summary === "string" ? payload.summary.trim() : "";
+    const progressText = typeof payload?.progressText === "string" ? payload.progressText.trim() : "";
+    const name = typeof payload?.name === "string" ? payload.name.trim() : "";
+    const detail = title || summary || progressText;
+    if (!detail) return;
+    const label = title || name || "шаг";
+    const extra = summary && summary !== title ? summary : (!title && progressText ? progressText : "");
+    await pushProgressLine(
+      extra
+        ? `${toolStatusIcon(name)} ${label}: ${truncateStatus(extra, 80)}`
+        : `${toolStatusIcon(name)} ${label}`,
+    );
+  }
+
+  async function onApprovalEvent(payload: { phase?: string; title?: string }) {
+    if (payload?.phase && payload.phase !== "requested") return;
+    const title = typeof payload?.title === "string" ? payload.title.trim() : "";
+    await pushProgressLine(
+      title ? `⏳ жду подтверждение: ${truncateStatus(title, 80)}` : "⏳ жду подтверждение…",
+    );
+  }
 
   // Called for each streaming partial (text is CUMULATIVE — full text so far)
   async function onPartialToken(text: string) {
     if (!text) return;
+    cancelPlaceholderTimer();
+    phase = "streaming";
+    armTypingSafety();
     // Keep typing indicator alive during streaming — stop only in deliver()
     accumulated = text; // SET not += (onPartialReply is cumulative)
-
-    if (!messageId) {
-      if (!creationPromise) {
-        // First call: create message, lock against concurrent calls
-        creationPromise = (async () => {
-          messageId = await sendReply(account, chatId, chatType, accumulated + " …");
-          lastEditAt = Date.now();
-          log?.info?.(`[openclaw-max] Streaming started mid=${messageId}`);
-        })();
-      }
-      await creationPromise;
-      return;
-    }
-
-    await throttledEdit(accumulated + " …");
+    await ensureVisible(accumulated + " …");
   }
 
   // Called once at end with final authoritative text
   async function deliver(payload: { text?: string; body?: string }) {
+    cancelPlaceholderTimer();
     stopTyping(); // Ensure typing stops even if no partial tokens came
-    if (pendingEdit) { clearTimeout(pendingEdit); pendingEdit = null; }
-    const finalText = payload?.text ?? payload?.body ?? accumulated;
+    if (pendingEdit) {
+      clearTimeout(pendingEdit);
+      pendingEdit = null;
+    }
+    const rawText = payload?.text ?? payload?.body ?? accumulated;
+    if (isSilentFinalText(rawText) && !accumulated) {
+      if (messageId && (phase === "status" || phase === "idle")) {
+        await deleteMessage(account.token, messageId);
+        messageId = null;
+        phase = "done";
+      }
+      return;
+    }
+    const finalText = isSilentFinalText(rawText) ? accumulated : rawText;
     if (!finalText) return;
-
+    phase = "done";
     if (messageId) {
-      // Edit existing streamed message — remove cursor, use final text
+      // Edit existing streamed/status message — remove cursor, use final text
       await editMessage(account.token, messageId, finalText);
     } else {
       // No partial tokens came through — send fresh
@@ -184,7 +348,24 @@ function createStreamingDeliver(
     }
   }
 
-  return { onPartialToken, deliver };
+  async function finish() {
+    cancelPlaceholderTimer();
+    stopTyping();
+    if (pendingEdit) {
+      clearTimeout(pendingEdit);
+      pendingEdit = null;
+    }
+    if (messageId && (phase === "status" || phase === "idle")) {
+      await deleteMessage(account.token, messageId).catch(() => {});
+      messageId = null;
+      phase = "done";
+    } else if (phase === "streaming" && messageId && accumulated) {
+      await editMessage(account.token, messageId, accumulated).catch(() => {});
+      phase = "done";
+    }
+  }
+
+  return { onPartialToken, onWorkStart, onThinking, onToolStart, onItemEvent, onApprovalEvent, deliver, finish };
 }
 
 /**
@@ -217,7 +398,13 @@ async function deliverMessage(
   log?: any,
 ): Promise<void> {
   const rt = getMaxRuntime();
-  const sessionKey = `max:${senderId}`;
+  const route = rt.channel.routing.resolveAgentRoute({
+    cfg,
+    channel: CHANNEL_ID,
+    accountId,
+    peer: { kind: chatType === "direct" ? "direct" : "group", id: senderId },
+  });
+  const sessionKey = route.sessionKey;
 
   const msgCtx = rt.channel.reply.finalizeInboundContext({
     Body: text,
@@ -239,28 +426,53 @@ async function deliverMessage(
     CommandAuthorized: true,
   });
 
-  const { onPartialToken, deliver } = createStreamingDeliver(account, chatId, dialogChatId, chatType, log);
+  const { onPartialToken, onWorkStart, onThinking, onToolStart, onItemEvent, onApprovalEvent, deliver, finish } =
+    createStreamingDeliver(account, chatId, dialogChatId, chatType, log);
 
-  await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: msgCtx,
-    cfg,
-    dispatcherOptions: {
-      deliver,
-      onReplyStart: () => {
-        log?.info?.(`[openclaw-max] Agent reply started for ${senderName}`);
+  try {
+    await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: msgCtx,
+      cfg,
+      dispatcherOptions: {
+        deliver,
+        onReplyStart: () => {
+          log?.info?.(`[openclaw-max] Agent reply started for ${senderName}`);
+          return onWorkStart();
+        },
       },
-    },
-    replyOptions: {
-      onPartialReply: async (payload: { text?: string }) => {
-        if (payload?.text) await onPartialToken(payload.text);
+      replyOptions: {
+        suppressDefaultToolProgressMessages: true,
+        preserveProgressCallbackStartOrder: true,
+        onPartialReply: async (payload: { text?: string }) => {
+          if (payload?.text) await onPartialToken(payload.text);
+        },
+        onReasoningStream: async () => {
+          await onThinking();
+        },
+        onToolStart: async (payload: { name?: string; args?: unknown }) => {
+          await onToolStart(payload);
+        },
+        onItemEvent: async (payload: {
+          title?: string;
+          summary?: string;
+          progressText?: string;
+          name?: string;
+        }) => {
+          await onItemEvent(payload);
+        },
+        onApprovalEvent: async (payload: { phase?: string; title?: string }) => {
+          await onApprovalEvent(payload);
+        },
+        images: images?.map(img => ({
+          type: "image" as const,
+          mimeType: img.mimeType,
+          data: img.data,
+        })),
       },
-      images: images?.map(img => ({
-        type: "image" as const,
-        mimeType: img.mimeType,
-        data: img.data,
-      })),
-    },
-  });
+    });
+  } finally {
+    await finish();
+  }
 }
 
 // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
@@ -454,6 +666,16 @@ export function createMaxPlugin(): any {
       },
     },
 
+    heartbeat: {
+      sendTyping: async ({ cfg, to, accountId }: { cfg?: any; to: string; accountId?: string }) => {
+        const account = resolveAccount(cfg ?? {}, accountId);
+        if (!account.token) return;
+        const numericId = parseInt(String(to).replace(/^max:(?:user:)?/i, ""), 10);
+        if (isNaN(numericId)) return;
+        await sendTypingAction(account.token, numericId);
+      },
+    },
+
     agentPrompt: {
       messageToolHints: () => [
         "",
@@ -490,7 +712,7 @@ async function startWebhookMode(ctx: any, account: ResolvedMaxAccount, _cfg: unk
   const handler = createWebhookHandler({
     account,
     deliver: async (msg) => {
-      const currentCfg = await getMaxRuntime().config.loadConfig();
+      const currentCfg = _cfg;
       await deliverMessage(msg, account, currentCfg, log);
       return null;
     },
@@ -546,7 +768,7 @@ async function startLongPollingMode(ctx: any, account: ResolvedMaxAccount, _cfg:
 
       if (result.updates.length > 0) {
         log?.info?.(`[openclaw-max] Received ${result.updates.length} update(s)`);
-        const currentCfg = await getMaxRuntime().config.loadConfig();
+        const currentCfg = _cfg;
 
         for (const update of result.updates) {
           await handleUpdate(

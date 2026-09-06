@@ -135,6 +135,20 @@ export async function editMessage(token: string, messageId: string, text: string
 }
 
 /**
+ * Delete a bot-sent message (placeholder cleanup on silent/NO_REPLY turns).
+ * DELETE /messages?message_id={id}
+ */
+export async function deleteMessage(token: string, messageId: string): Promise<boolean> {
+  try {
+    await maxRequest(token, "DELETE", "/messages", { message_id: messageId });
+    return true;
+  } catch (err) {
+    console.warn(`[openclaw-max] deleteMessage error: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+/**
  * Send typing indicator to a chat.
  * action: "typing_on" | "typing_off" | "sending_photo" | "sending_video" | "sending_audio"
  */
@@ -261,7 +275,7 @@ export async function getUploadUrl(token: string, type: "image" | "video" | "aud
 export async function uploadFile(uploadUrl: string, buffer: Buffer, mimeType: string, filename: string): Promise<{ token: string } | null> {
   try {
     const form = new FormData();
-    form.append("data", new Blob([buffer], { type: mimeType }), filename);
+    form.append("data", new Blob([new Uint8Array(buffer)], { type: mimeType }), filename);
     const res = await fetch(uploadUrl, {
       method: "POST",
       body: form,
