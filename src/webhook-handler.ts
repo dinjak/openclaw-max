@@ -1,5 +1,3 @@
-// @ts-nocheck
-/* patched copy of dist webhook-handler.js — do not tsc-overwrite without this marker */
 /**
  * Inbound webhook handler for MAX Bot API events.
  * Patched locally:
@@ -15,13 +13,15 @@
  * Source: @olegbalbekov/openclaw-max dist/src/webhook-handler.js
  */
 import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { downloadFile, downloadFileMeta, getFileByToken, getVideoDownloadUrl } from "./client.js";
+
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
 const IMAGE_KINDS = new Set(["image", "photo", "sticker"]);
 const FILE_KINDS = new Set(["file", "audio", "video", "document"]);
-const MIME_EXT = {
+const MIME_EXT: Record<string, string> = {
     "application/pdf": "pdf",
     "application/zip": "zip",
     "application/gzip": "gz",
@@ -47,10 +47,12 @@ const MIME_EXT = {
     "image/webp": "webp",
     "image/gif": "gif",
 };
+
 export interface InboundImage {
     data: string;
     mimeType: string;
 }
+
 export interface WebhookDeliverMsg {
     text: string;
     senderId: string;
@@ -62,19 +64,92 @@ export interface WebhookDeliverMsg {
     accountId: string;
     images?: InboundImage[];
 }
-function respondJson(res, code, body) {
+
+type MaxLog = {
+    info: (...args: unknown[]) => void;
+    warn: (...args: unknown[]) => void;
+    error: (...args: unknown[]) => void;
+};
+
+type WebhookAccount = {
+    token: string;
+    accountId: string;
+    webhookSecret?: string;
+    dmPolicy: "open" | "allowlist" | "pairing" | "disabled";
+    allowFrom: string[];
+};
+
+type DeliverFn = (msg: WebhookDeliverMsg) => Promise<string | null>;
+
+interface InboundSender {
+    user_id?: string | number;
+    name?: string;
+    username?: string;
+    is_bot?: boolean;
+}
+
+interface InboundRecipient {
+    chat_id?: string | number;
+    chat_type?: string;
+}
+
+interface InboundBody {
+    text?: unknown;
+    mid?: string;
+    attachments?: unknown;
+    attaches?: unknown;
+}
+
+interface InboundLink {
+    type?: unknown;
+    message?: unknown;
+    sender?: { name?: string };
+    chat_name?: unknown;
+    chatName?: unknown;
+}
+
+interface InboundMessage {
+    sender?: InboundSender;
+    recipient?: InboundRecipient;
+    timestamp?: string | number;
+    body?: InboundBody;
+    link?: InboundLink;
+    attachments?: unknown;
+    attaches?: unknown;
+    text?: unknown;
+}
+
+interface SizedUrl {
+    url: string;
+    area: number;
+}
+
+interface SavedFileBytes {
+    buf: Buffer;
+    filename?: string;
+    contentType?: string;
+    kind: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function respondJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
 }
-function respondOk(res) {
+
+function respondOk(res: ServerResponse): void {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 }
-async function readBody(req) {
+
+async function readBody(req: IncomingMessage): Promise<string | null> {
     return new Promise((resolve) => {
         let data = "";
         let size = 0;
-        req.on("data", (chunk) => {
+        req.on("data", (chunk: Buffer | string) => {
             size += chunk.length;
             if (size > MAX_BODY_BYTES) {
                 req.destroy();
@@ -87,13 +162,15 @@ async function readBody(req) {
         req.on("error", () => resolve(null));
     });
 }
-function validateSecret(req, secret) {
+
+function validateSecret(req: IncomingMessage, secret: string | undefined): boolean {
     if (!secret)
         return true;
     const header = req.headers["x-max-bot-api-secret"];
     return header === secret;
 }
-function detectMimeType(buf) {
+
+function detectMimeType(buf: Buffer): string {
     if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47)
         return "image/png";
     if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF)
@@ -105,13 +182,15 @@ function detectMimeType(buf) {
         return "image/gif";
     return "image/jpeg";
 }
-function extractMessage(update) {
-    if (update.update_type === "message_created") {
-        return update.message ?? null;
+
+function extractMessage(update: unknown): InboundMessage | null {
+    if ((update as { update_type?: unknown }).update_type === "message_created") {
+        return ((update as { message?: InboundMessage | null }).message ?? null);
     }
     return null;
 }
-function resolveChatType(msg) {
+
+function resolveChatType(msg: InboundMessage): "direct" | "chat" | "channel" {
     const t = msg.recipient?.chat_type;
     if (t === "dialog")
         return "direct";
@@ -119,46 +198,63 @@ function resolveChatType(msg) {
         return "channel";
     return "chat";
 }
-function asList(value) {
+
+function asList(value: unknown): unknown[] {
     return Array.isArray(value) ? value : [];
 }
-function collectAttachments(...objs) {
-    const out = [];
+
+function collectAttachments(...objs: unknown[]): unknown[] {
+    const out: unknown[] = [];
     for (const obj of objs) {
-        if (!obj || typeof obj !== "object")
+        if (!isRecord(obj))
             continue;
         out.push(...asList(obj.attachments));
         out.push(...asList(obj.attaches));
     }
     return out;
 }
-function attachKind(a) {
-    return String(a?._type || a?.type || "").toLowerCase();
+
+function attachKind(a: unknown): string {
+    const rec = isRecord(a) ? a : undefined;
+    return String(rec?._type || rec?.type || "").toLowerCase();
 }
-function attachFilename(a) {
-    const payload = a?.payload && typeof a.payload === "object" ? a.payload : {};
-    return String(a?.filename || payload.filename || payload.name || payload.fileName ||
-        a?.fileName || a?.name || payload.file_name || "").trim();
+
+function payloadOf(att: unknown): Record<string, unknown> {
+    if (!isRecord(att))
+        return {};
+    return isRecord(att.payload) ? att.payload : {};
 }
-function isImageAttach(a) {
+
+function attachFilename(a: unknown): string {
+    const payload = payloadOf(a);
+    const rec = isRecord(a) ? a : {};
+    return String(rec.filename || payload.filename || payload.name || payload.fileName ||
+        rec.fileName || rec.name || payload.file_name || "").trim();
+}
+
+function isImageAttach(a: unknown): boolean {
     const kind = attachKind(a);
     if (IMAGE_KINDS.has(kind))
         return true;
     const name = attachFilename(a).toLowerCase();
     return kind === "file" && /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
 }
-function isFileLikeAttach(a) {
+
+function isFileLikeAttach(a: unknown): boolean {
     return FILE_KINDS.has(attachKind(a)) && !isImageAttach(a);
 }
-function attachToken(a) {
-    const payload = a?.payload && typeof a.payload === "object" ? a.payload : {};
-    const value = payload.token || a?.token || payload.file_token || a?.file_token;
+
+function attachToken(a: unknown): string | null {
+    const payload = payloadOf(a);
+    const rec = isRecord(a) ? a : {};
+    const value = payload.token || rec.token || payload.file_token || rec.file_token;
     return typeof value === "string" && value.trim() ? value.trim() : null;
 }
-function mediaUrlFromAttach(att) {
-    const payload = att?.payload && typeof att.payload === "object" ? att.payload : {};
+
+function mediaUrlFromAttach(att: unknown): string | null {
+    const payload = payloadOf(att);
     for (const src of [payload, att]) {
-        if (!src || typeof src !== "object")
+        if (!isRecord(src))
             continue;
         for (const key of ["url", "fileUrl", "file_url", "downloadUrl", "download_url"]) {
             const url = httpUrl(src[key]);
@@ -168,34 +264,43 @@ function mediaUrlFromAttach(att) {
     }
     return null;
 }
-function httpUrl(value) {
+
+function httpUrl(value: unknown): string | null {
     return typeof value === "string" && /^https?:\/\//i.test(value) ? value : null;
 }
-function sizedUrl(obj) {
-    const url = httpUrl(obj?.url);
+
+function sizedUrl(obj: unknown): SizedUrl | null {
+    if (!isRecord(obj))
+        return null;
+    const url = httpUrl(obj.url);
     if (!url)
         return null;
     const w = Number(obj.width ?? obj.w ?? 0);
     const h = Number(obj.height ?? obj.h ?? 0);
     return { url, area: Math.max(0, w) * Math.max(0, h) };
 }
-function lsUrls(src) {
-    const urls = [];
-    for (const item of asList(src?.ls)) {
+
+function lsUrls(src: unknown): string[] {
+    const urls: string[] = [];
+    for (const item of asList(isRecord(src) ? src.ls : undefined)) {
         if (typeof item === "string" && httpUrl(item))
             urls.push(item);
-        else if (item && httpUrl(item.url))
-            urls.push(item.url);
+        else if (isRecord(item)) {
+            const url = httpUrl(item.url);
+            if (url)
+                urls.push(url);
+        }
     }
     return urls;
 }
-function imageUrlFromAttach(att) {
-    const payload = att?.payload && typeof att.payload === "object" ? att.payload : {};
-    const sized = [];
-    const ls = [];
-    const explicit = [];
+
+function imageUrlFromAttach(att: unknown): string | null {
+    const payload = payloadOf(att);
+    const sized: SizedUrl[] = [];
+    const ls: string[] = [];
+    const explicit: string[] = [];
     for (const src of [payload, att]) {
-        if (!src || typeof src !== "object")
+        if (!isRecord(src))
             continue;
         for (const key of ["url", "photoUrl", "photo_url", "image_url", "fileUrl", "file_url"]) {
             const url = httpUrl(src[key]);
@@ -204,13 +309,15 @@ function imageUrlFromAttach(att) {
         }
         ls.push(...lsUrls(src));
         for (const item of [...asList(src.photo), ...asList(src.photos), ...asList(src.sizes)]) {
-            const got = sizedUrl(item) || (typeof item === "string" && httpUrl(item) ? { url: item, area: 0 } : null);
+            const fromString = typeof item === "string" && httpUrl(item) ? { url: item, area: 0 } : null;
+            const got = sizedUrl(item) || fromString;
             if (got)
                 sized.push(got);
         }
         if (src.photos && typeof src.photos === "object" && !Array.isArray(src.photos)) {
             for (const val of Object.values(src.photos)) {
-                const got = sizedUrl(val) || (httpUrl(val?.url) ? { url: val.url, area: 0 } : null);
+                const direct = isRecord(val) ? httpUrl(val.url) : null;
+                const got = sizedUrl(val) || (direct ? { url: direct, area: 0 } : null);
                 if (got)
                     sized.push(got);
             }
@@ -223,8 +330,11 @@ function imageUrlFromAttach(att) {
         return ls[ls.length - 1];
     return explicit[0] || sized[0]?.url || null;
 }
-function previewImageFromAttach(att) {
-    const raw = att?.previewData || att?.preview_data || att?.payload?.previewData || att?.payload?.preview_data;
+
+function previewImageFromAttach(att: unknown): InboundImage | null {
+    const rec = isRecord(att) ? att : undefined;
+    const payload = rec && isRecord(rec.payload) ? rec.payload : undefined;
+    const raw = rec?.previewData || rec?.preview_data || payload?.previewData || payload?.preview_data;
     if (typeof raw !== "string" || raw.length < 64)
         return null;
     let mime = "image/jpeg";
@@ -244,23 +354,27 @@ function previewImageFromAttach(att) {
         return null;
     }
 }
-function attachDebug(a) {
-    const payload = a?.payload && typeof a.payload === "object" ? a.payload : null;
-    const keys = Object.keys(a || {}).join(",");
+
+function attachDebug(a: unknown): string {
+    const payload = isRecord(a) && isRecord(a.payload) ? a.payload : null;
+    const keys = Object.keys(isRecord(a) ? a : {}).join(",");
     const pkeys = payload ? Object.keys(payload).join(",") : "-";
     return `kind=${attachKind(a) || "-"} keys=${keys || "-"} payloadKeys=${pkeys} filename=${attachFilename(a) || "-"} hasToken=${Boolean(attachToken(a))} hasUrl=${Boolean(imageUrlFromAttach(a) || mediaUrlFromAttach(a))} hasPreview=${Boolean(previewImageFromAttach(a))}`;
 }
-function linkedBody(link) {
-    const inner = link?.message;
-    if (!inner || typeof inner !== "object")
+
+function linkedBody(link: unknown): { text: string; attachments: unknown[] } {
+    const inner = isRecord(link) ? link.message : undefined;
+    if (!isRecord(inner))
         return { text: "", attachments: [] };
+    const body = isRecord(inner.body) ? inner.body : undefined;
     return {
-        text: String(inner.body?.text ?? inner.text ?? "").trim(),
+        text: String(body?.text ?? inner.text ?? "").trim(),
         attachments: collectAttachments(inner, inner.body),
     };
 }
-function attachmentSummary(atts) {
-    const parts = [];
+
+function attachmentSummary(atts: unknown): string {
+    const parts: string[] = [];
     for (const a of asList(atts)) {
         if (isImageAttach(a)) {
             parts.push("[image]");
@@ -275,7 +389,8 @@ function attachmentSummary(atts) {
     }
     return parts.length ? parts.join(" ") : "";
 }
-function resolveInbound(msg) {
+
+function resolveInbound(msg: InboundMessage): { text: string; attachments: unknown[] } {
     const ownText = String(msg.body?.text ?? "").trim();
     const ownAtts = collectAttachments(msg, msg.body);
     const link = msg.link;
@@ -300,11 +415,13 @@ function resolveInbound(msg) {
         text = text ? `${text}\n${extra}` : extra;
     return { text: text.trim(), attachments };
 }
-function inboundMediaDir() {
+
+function inboundMediaDir(): string {
     const home = process.env.HOME || os.homedir() || "/root";
     return path.join(home, ".openclaw", "media", "inbound");
 }
-function extForMime(mime) {
+
+function extForMime(mime: string): string {
     if (mime === "image/png")
         return "png";
     if (mime === "image/webp")
@@ -313,8 +430,9 @@ function extForMime(mime) {
         return "gif";
     return "jpg";
 }
-function saveInboundImages(buffers, messageId, log) {
-    const paths = [];
+
+function saveInboundImages(buffers: Array<{ buf: Buffer; mimeType: string }>, messageId: string, log?: MaxLog): string[] {
+    const paths: string[] = [];
     if (!buffers.length)
         return paths;
     const dir = inboundMediaDir();
@@ -338,20 +456,23 @@ function saveInboundImages(buffers, messageId, log) {
     });
     return paths;
 }
-function sanitizeFileName(name) {
+
+function sanitizeFileName(name: unknown): string {
     const base = path.basename(String(name || "file")).replace(/[/\\]/g, "");
     const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^\.+/, "").slice(0, 120);
     return cleaned || "file";
 }
-function defaultExtForKind(kind) {
+
+function defaultExtForKind(kind: unknown): string {
     if (kind === "video")
         return "mp4";
     if (kind === "audio")
         return "mp3";
     return "bin";
 }
-function extensionFor(name, contentType, kind) {
-    const fromName = path.extname(name || "").replace(/^\./, "").toLowerCase();
+
+function extensionFor(name: unknown, contentType: unknown, kind: unknown): string {
+    const fromName = path.extname(String(name || "")).replace(/^\./, "").toLowerCase();
     if (/^[a-z0-9]{1,8}$/.test(fromName))
         return fromName;
     const mime = String(contentType || "").split(";")[0].trim().toLowerCase();
@@ -359,7 +480,8 @@ function extensionFor(name, contentType, kind) {
         return MIME_EXT[mime];
     return defaultExtForKind(kind);
 }
-function saveInboundFile(buf, messageId, index, preferredName, contentType, kind, log) {
+
+function saveInboundFile(buf: Buffer, messageId: string, index: number, preferredName: unknown, contentType: unknown, kind: unknown, log?: MaxLog): string | null {
     const dir = inboundMediaDir();
     try {
         fs.mkdirSync(dir, { recursive: true });
@@ -382,12 +504,13 @@ function saveInboundFile(buf, messageId, index, preferredName, contentType, kind
         return null;
     }
 }
-async function resolveFileBytes(att, token, log) {
+
+async function resolveFileBytes(att: unknown, token: string, log?: MaxLog): Promise<SavedFileBytes | null> {
     const kind = attachKind(att) || "file";
     let url = mediaUrlFromAttach(att);
     let filename = attachFilename(att) || undefined;
-    let contentType;
-    let buf;
+    let contentType: string | undefined;
+    let buf: Buffer | undefined;
     const fileToken = attachToken(att);
     if (kind === "video" && fileToken) {
         const videoUrl = await getVideoDownloadUrl(token, fileToken);
@@ -424,8 +547,9 @@ async function resolveFileBytes(att, token, log) {
         return null;
     return { buf, filename, contentType, kind };
 }
-async function downloadAndSaveFiles(atts, token, messageId, log) {
-    const lines = [];
+
+async function downloadAndSaveFiles(atts: unknown, token: string, messageId: string, log?: MaxLog): Promise<{ lines: string[]; saved: number; failed: number }> {
+    const lines: string[] = [];
     let saved = 0;
     let failed = 0;
     let index = 0;
@@ -457,9 +581,15 @@ async function downloadAndSaveFiles(atts, token, messageId, log) {
     }
     return { lines, saved, failed };
 }
-async function downloadImages(atts, token, log) {
-    const images = [];
-    const buffers = [];
+
+async function downloadImages(atts: unknown, token: string, log?: MaxLog): Promise<{
+    images: InboundImage[];
+    buffers: Array<{ buf: Buffer; mimeType: string }>;
+    urlCount: number;
+    previewCount: number;
+}> {
+    const images: InboundImage[] = [];
+    const buffers: Array<{ buf: Buffer; mimeType: string }> = [];
     let urlCount = 0;
     let previewCount = 0;
     for (const att of asList(atts).filter(isImageAttach)) {
@@ -486,7 +616,8 @@ async function downloadImages(atts, token, log) {
     }
     return { images, buffers, urlCount, previewCount };
 }
-function safeHost(url) {
+
+function safeHost(url: string): string {
     try {
         return new URL(url).host;
     }
@@ -494,11 +625,12 @@ function safeHost(url) {
         return "-";
     }
 }
+
 export function createWebhookHandler(deps: {
-    account: { token: string; webhookSecret?: string; accountId: string };
-    deliver: (msg: WebhookDeliverMsg) => Promise<string | null>;
-    log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
-}) {
+    account: WebhookAccount;
+    deliver: DeliverFn;
+    log?: MaxLog;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
     const { account, deliver, log } = deps;
     return async (req, res) => {
         if (req.method !== "POST") {
@@ -515,7 +647,7 @@ export function createWebhookHandler(deps: {
             respondJson(res, 400, { error: "Invalid body" });
             return;
         }
-        let update;
+        let update: unknown;
         try {
             update = JSON.parse(body);
         }
@@ -527,12 +659,13 @@ export function createWebhookHandler(deps: {
         await handleUpdate(update, account, deliver, log);
     };
 }
+
 export async function handleUpdate(
-    update,
-    account,
-    deliver: (msg: WebhookDeliverMsg) => Promise<string | null>,
-    log,
-) {
+    update: unknown,
+    account: WebhookAccount,
+    deliver: DeliverFn,
+    log?: MaxLog,
+): Promise<void> {
     const msg = extractMessage(update);
     if (!msg)
         return;
@@ -592,7 +725,8 @@ export async function handleUpdate(
         log?.error(`[openclaw-max] Deliver error: ${err instanceof Error ? err.message : String(err)}`);
     }
 }
-function checkDmPolicy(userId, account) {
+
+function checkDmPolicy(userId: string, account: WebhookAccount): boolean {
     const policy = account.dmPolicy;
     if (policy === "disabled")
         return false;
