@@ -330,10 +330,13 @@ export async function downloadFileMeta(token: string, url: string): Promise<Down
     if (!res.ok) return null;
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) return null;
+    const headers = res.headers;
+    const header = (name: string) =>
+      headers && typeof headers.get === "function" ? headers.get(name) : null;
     return {
       buf,
-      contentType: res.headers.get("content-type") ?? undefined,
-      filename: filenameFromDisposition(res.headers.get("content-disposition")),
+      contentType: header("content-type") ?? undefined,
+      filename: filenameFromDisposition(header("content-disposition")),
     };
   } catch {
     return null;
