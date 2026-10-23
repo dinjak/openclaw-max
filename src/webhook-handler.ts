@@ -6,18 +6,62 @@
  *  - unwrap forwarded messages from link.message (body.text is empty)
  *  - pull screenshots from PHOTO/_type, payload.ls, photos, previewData
  *  - save inbound images to ~/.openclaw/media/inbound so view_image sees THIS file
+ *  - download non-image attachments (file/audio/video) to the same inbound dir
  * Marker: openclaw-max-forward-unwrap
  * Marker: openclaw-max-forward-images
  * Marker: openclaw-max-save-inbound
+ * Marker: openclaw-max-save-inbound-files
  *
  * Source: @olegbalbekov/openclaw-max dist/src/webhook-handler.js
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { downloadFile } from "./client.js";
+import { downloadFile, downloadFileMeta, getFileByToken, getVideoDownloadUrl } from "./client.js";
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
 const IMAGE_KINDS = new Set(["image", "photo", "sticker"]);
+const FILE_KINDS = new Set(["file", "audio", "video", "document"]);
+const MIME_EXT = {
+    "application/pdf": "pdf",
+    "application/zip": "zip",
+    "application/gzip": "gz",
+    "application/json": "json",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "text/plain": "txt",
+    "text/csv": "csv",
+    "text/html": "html",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+};
+export interface InboundImage {
+    data: string;
+    mimeType: string;
+}
+export interface WebhookDeliverMsg {
+    text: string;
+    senderId: string;
+    senderName: string;
+    chatId: string;
+    dialogChatId: string;
+    chatType: "direct" | "chat" | "channel";
+    messageId: string;
+    accountId: string;
+    images?: InboundImage[];
+}
 function respondJson(res, code, body) {
     res.writeHead(code, { "Content-Type": "application/json" });
     res.end(JSON.stringify(body));
@@ -91,12 +135,38 @@ function collectAttachments(...objs) {
 function attachKind(a) {
     return String(a?._type || a?.type || "").toLowerCase();
 }
+function attachFilename(a) {
+    const payload = a?.payload && typeof a.payload === "object" ? a.payload : {};
+    return String(a?.filename || payload.filename || payload.name || payload.fileName ||
+        a?.fileName || a?.name || payload.file_name || "").trim();
+}
 function isImageAttach(a) {
     const kind = attachKind(a);
     if (IMAGE_KINDS.has(kind))
         return true;
-    const name = String(a?.payload?.filename || a?.payload?.name || a?.fileName || a?.name || "").toLowerCase();
+    const name = attachFilename(a).toLowerCase();
     return kind === "file" && /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(name);
+}
+function isFileLikeAttach(a) {
+    return FILE_KINDS.has(attachKind(a)) && !isImageAttach(a);
+}
+function attachToken(a) {
+    const payload = a?.payload && typeof a.payload === "object" ? a.payload : {};
+    const value = payload.token || a?.token || payload.file_token || a?.file_token;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+function mediaUrlFromAttach(att) {
+    const payload = att?.payload && typeof att.payload === "object" ? att.payload : {};
+    for (const src of [payload, att]) {
+        if (!src || typeof src !== "object")
+            continue;
+        for (const key of ["url", "fileUrl", "file_url", "downloadUrl", "download_url"]) {
+            const url = httpUrl(src[key]);
+            if (url)
+                return url;
+        }
+    }
+    return null;
 }
 function httpUrl(value) {
     return typeof value === "string" && /^https?:\/\//i.test(value) ? value : null;
@@ -178,7 +248,7 @@ function attachDebug(a) {
     const payload = a?.payload && typeof a.payload === "object" ? a.payload : null;
     const keys = Object.keys(a || {}).join(",");
     const pkeys = payload ? Object.keys(payload).join(",") : "-";
-    return `kind=${attachKind(a) || "-"} keys=${keys || "-"} payloadKeys=${pkeys} hasUrl=${Boolean(imageUrlFromAttach(a))} hasPreview=${Boolean(previewImageFromAttach(a))}`;
+    return `kind=${attachKind(a) || "-"} keys=${keys || "-"} payloadKeys=${pkeys} filename=${attachFilename(a) || "-"} hasToken=${Boolean(attachToken(a))} hasUrl=${Boolean(imageUrlFromAttach(a) || mediaUrlFromAttach(a))} hasPreview=${Boolean(previewImageFromAttach(a))}`;
 }
 function linkedBody(link) {
     const inner = link?.message;
@@ -196,8 +266,11 @@ function attachmentSummary(atts) {
             parts.push("[image]");
             continue;
         }
+        // file/audio/video placeholders are replaced after download with [file: <abs path>]
+        if (isFileLikeAttach(a))
+            continue;
         const type = attachKind(a) || "file";
-        const name = a?.payload?.filename || a?.payload?.name || a?.fileName || a?.name || type;
+        const name = attachFilename(a) || type;
         parts.push(`[${type}: ${name}]`);
     }
     return parts.length ? parts.join(" ") : "";
@@ -265,6 +338,125 @@ function saveInboundImages(buffers, messageId, log) {
     });
     return paths;
 }
+function sanitizeFileName(name) {
+    const base = path.basename(String(name || "file")).replace(/[/\\]/g, "");
+    const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^\.+/, "").slice(0, 120);
+    return cleaned || "file";
+}
+function defaultExtForKind(kind) {
+    if (kind === "video")
+        return "mp4";
+    if (kind === "audio")
+        return "mp3";
+    return "bin";
+}
+function extensionFor(name, contentType, kind) {
+    const fromName = path.extname(name || "").replace(/^\./, "").toLowerCase();
+    if (/^[a-z0-9]{1,8}$/.test(fromName))
+        return fromName;
+    const mime = String(contentType || "").split(";")[0].trim().toLowerCase();
+    if (MIME_EXT[mime])
+        return MIME_EXT[mime];
+    return defaultExtForKind(kind);
+}
+function saveInboundFile(buf, messageId, index, preferredName, contentType, kind, log) {
+    const dir = inboundMediaDir();
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    catch (err) {
+        log?.warn(`[openclaw-max] inbound dir: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+    const safeMid = String(messageId).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(-80);
+    const safeName = sanitizeFileName(preferredName);
+    const ext = extensionFor(safeName, contentType, kind);
+    const stem = safeName.replace(/\.[a-z0-9]{1,8}$/i, "") || "file";
+    const file = path.resolve(path.join(dir, `max-${safeMid}-file-${index}-${stem}.${ext}`));
+    try {
+        fs.writeFileSync(file, buf);
+        return file;
+    }
+    catch (err) {
+        log?.warn(`[openclaw-max] save file failed: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+    }
+}
+async function resolveFileBytes(att, token, log) {
+    const kind = attachKind(att) || "file";
+    let url = mediaUrlFromAttach(att);
+    let filename = attachFilename(att) || undefined;
+    let contentType;
+    let buf;
+    const fileToken = attachToken(att);
+    if (kind === "video" && fileToken) {
+        const videoUrl = await getVideoDownloadUrl(token, fileToken);
+        if (videoUrl)
+            url = videoUrl;
+        else
+            log?.warn(`[openclaw-max] video url lookup failed ${attachDebug(att)}`);
+    }
+    if (!url && fileToken) {
+        const resolved = await getFileByToken(token, fileToken);
+        if (resolved?.buf) {
+            buf = resolved.buf;
+            contentType = resolved.contentType;
+        }
+        if (resolved?.url)
+            url = resolved.url;
+        if (resolved?.filename)
+            filename = filename || resolved.filename;
+        if (!resolved)
+            log?.warn(`[openclaw-max] GET /files/{token} failed ${attachDebug(att)}`);
+    }
+    if (!buf && url) {
+        const got = await downloadFileMeta(token, url);
+        if (got) {
+            buf = got.buf;
+            contentType = contentType || got.contentType;
+            filename = filename || got.filename;
+        }
+        else {
+            log?.warn(`[openclaw-max] file download failed host=${safeHost(url)}`);
+        }
+    }
+    if (!buf || !buf.length)
+        return null;
+    return { buf, filename, contentType, kind };
+}
+async function downloadAndSaveFiles(atts, token, messageId, log) {
+    const lines = [];
+    let saved = 0;
+    let failed = 0;
+    let index = 0;
+    for (const att of asList(atts)) {
+        try {
+            const got = await resolveFileBytes(att, token, log);
+            if (!got) {
+                failed += 1;
+                lines.push("[file: не удалось скачать]");
+                log?.warn(`[openclaw-max] file skipped ${attachDebug(att)}`);
+                continue;
+            }
+            const preferred = got.filename || "file";
+            const filePath = saveInboundFile(got.buf, messageId, index, preferred, got.contentType, got.kind, log);
+            index += 1;
+            if (!filePath) {
+                failed += 1;
+                lines.push("[file: не удалось скачать]");
+                continue;
+            }
+            saved += 1;
+            lines.push(`[file: ${filePath}]`);
+        }
+        catch (err) {
+            failed += 1;
+            lines.push("[file: не удалось скачать]");
+            log?.warn(`[openclaw-max] file error: ${err instanceof Error ? err.message : String(err)} ${attachDebug(att)}`);
+        }
+    }
+    return { lines, saved, failed };
+}
 async function downloadImages(atts, token, log) {
     const images = [];
     const buffers = [];
@@ -302,7 +494,11 @@ function safeHost(url) {
         return "-";
     }
 }
-export function createWebhookHandler(deps) {
+export function createWebhookHandler(deps: {
+    account: { token: string; webhookSecret?: string; accountId: string };
+    deliver: (msg: WebhookDeliverMsg) => Promise<string | null>;
+    log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
+}) {
     const { account, deliver, log } = deps;
     return async (req, res) => {
         if (req.method !== "POST") {
@@ -331,13 +527,19 @@ export function createWebhookHandler(deps) {
         await handleUpdate(update, account, deliver, log);
     };
 }
-export async function handleUpdate(update, account, deliver, log) {
+export async function handleUpdate(
+    update,
+    account,
+    deliver: (msg: WebhookDeliverMsg) => Promise<string | null>,
+    log,
+) {
     const msg = extractMessage(update);
     if (!msg)
         return;
     const inbound = resolveInbound(msg);
     const imageAttachments = inbound.attachments.filter(isImageAttach);
-    if (!inbound.text && imageAttachments.length === 0) {
+    const fileAttachments = inbound.attachments.filter(isFileLikeAttach);
+    if (!inbound.text && imageAttachments.length === 0 && fileAttachments.length === 0) {
         log?.info(`[openclaw-max] skip empty update link=${msg.link?.type ?? "-"} mid=${msg.body?.mid ?? "-"}`);
         return;
     }
@@ -363,12 +565,16 @@ export async function handleUpdate(update, account, deliver, log) {
     }
     const media = await downloadImages(imageAttachments, account.token, log);
     const savedPaths = saveInboundImages(media.buffers, messageId, log);
+    const files = await downloadAndSaveFiles(fileAttachments, account.token, messageId, log);
     let text = inbound.text;
     if (savedPaths.length) {
         const lines = savedPaths.map((p) => `[image: ${p}]`);
         text = text ? `${text}\n${lines.join("\n")}` : lines.join("\n");
     }
-    log?.info(`[openclaw-max] Message from ${senderName} (${senderId}): ${text.slice(0, 80)} media=${imageAttachments.length} url=${media.urlCount} preview=${media.previewCount} downloaded=${media.images.length} saved=${savedPaths.length}`);
+    if (files.lines.length) {
+        text = text ? `${text}\n${files.lines.join("\n")}` : files.lines.join("\n");
+    }
+    log?.info(`[openclaw-max] Message from ${senderName} (${senderId}): ${text.slice(0, 80)} media=${imageAttachments.length} url=${media.urlCount} preview=${media.previewCount} downloaded=${media.images.length} saved=${savedPaths.length} files=${fileAttachments.length} fileSaved=${files.saved} fileFailed=${files.failed}`);
     try {
         await deliver({
             text,

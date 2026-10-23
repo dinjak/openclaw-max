@@ -65,6 +65,9 @@ export interface MaxImagePayload {
   token?: string;
   url?: string;
   file_id?: string;
+  filename?: string;
+  name?: string;
+  fileName?: string;
   width?: number;
   height?: number;
 }
@@ -72,6 +75,8 @@ export interface MaxImagePayload {
 export interface MaxAttachment {
   type: "image" | "video" | "audio" | "file" | "inline_keyboard" | "sticker" | "location";
   payload: MaxImagePayload;
+  filename?: string;
+  size?: number;
 }
 
 export interface MaxMessageBody {
